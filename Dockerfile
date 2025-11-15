@@ -1,4 +1,4 @@
-# Dockerfile — self-contained (creates /zeno.sh automatically)
+# Dockerfile — self-contained (creates /zeno.sh automatically and prints ngrok URL)
 FROM ubuntu:latest
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -12,9 +12,10 @@ RUN apt-get update -y \
     wget \
     unzip \
     ca-certificates \
+    curl \
  && rm -rf /var/lib/apt/lists/*
 
-# generate locale
+# generate locale (ignore errors on some minimal images)
 RUN localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8 || true
 
 # Download ngrok and place into /usr/local/bin
@@ -30,22 +31,21 @@ RUN mkdir -p /run/sshd \
  && sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true \
  && echo "root:zeno" | chpasswd
 
-# Create zeno.sh inside the image (debug-friendly, won't print token)
+# Create zeno.sh inside the image (debug-friendly, won't print full token)
 RUN cat > /zeno.sh <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
-# Debug helper: show token presence (not the full token)
+# show presence of NGROK_TOKEN without printing it
 if [ -n "${NGROK_TOKEN-}" ]; then
   token_len=${#NGROK_TOKEN}
-  # show last 4 chars safely using bash substring
   masked="****${NGROK_TOKEN: -4}"
   echo "NGROK_TOKEN present (length=${token_len}, last4=${masked})"
 else
   echo "NGROK_TOKEN is NOT set"
 fi
 
-# Select ngrok binary
+# determine ngrok binary
 NGROK_BIN="/usr/local/bin/ngrok"
 if [ ! -x "$NGROK_BIN" ]; then
   if [ -x "./ngrok" ]; then
@@ -60,7 +60,7 @@ fi
 
 echo "ngrok binary: $NGROK_BIN"
 
-# Configure ngrok (capture output to logs)
+# configure ngrok if token provided
 if [ -n "${NGROK_TOKEN-}" ]; then
   echo "Configuring ngrok token..."
   if ! "$NGROK_BIN" config add-authtoken "$NGROK_TOKEN" > /tmp/ngrok_config.log 2>&1; then
@@ -71,14 +71,31 @@ if [ -n "${NGROK_TOKEN-}" ]; then
   fi
 
   echo "Starting ngrok tcp 22 (background). Output -> /tmp/ngrok_run.log"
-  nohup "$NGROK_BIN" tcp 22 > /tmp/ngrok_run.log 2>&1 &
-  sleep 1
+  # enable stdout logging and run in background
+  nohup "$NGROK_BIN" tcp 22 --log=stdout --log-format=logfmt > /tmp/ngrok_run.log 2>&1 &
+  sleep 3
+
+  # try to fetch public URL via ngrok local API and print it (so Railway logs show it)
+  echo "Fetching ngrok public URL..."
+  # attempt several times if tunnel not ready immediately
+  for i in 1 2 3 4 5; do
+    sleep 1
+    url=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -o 'tcp://[^"]*' || true)
+    if [ -n "$url" ]; then
+      echo "$url"
+      break
+    else
+      echo "Tunnel not ready yet (attempt $i)..."
+    fi
+  done
+
+  echo "ngrok background process status:"
   ps aux | grep -E "[n]grok" || true
 else
   echo "NGROK_TOKEN not provided; skipping ngrok"
 fi
 
-# Start sshd in foreground so container stays alive
+# start sshd in foreground so container stays alive
 echo "Starting sshd..."
 exec /usr/sbin/sshd -D
 EOF
